@@ -1,17 +1,19 @@
 import socks
 
-API_HASH = ""
+API_HASH = ''
 API_ID = 0
-BOT_TOKEN = ":"
+BOT_TOKEN = ''
 
-SSSR_BOT_NAME = "sssr_media_bot"
-SSSR_SESSION = 'session/sssr_media_bot'
+SSSR_BOT_NAME = ''
+SSSR_SESSION = 'session/bot'
 
-GRAB_TIMEOUT = 25
+AGENT_E_SESSION = 'session/e_agent'
+AGENT_SESSION = 'session/agent'
 
-AGENT_SESSION = "session/agent"
-
-DATABASE_CONTAINER = 'database'
+DATABASE_HOST = ''
+DATABASE_NAME = ''
+DATABASE_USER = ''
+DATABASE_PASSWORD = ''
 
 PROXY_TYPE = socks.SOCKS5
 PROXY_ADDRESS = ''
