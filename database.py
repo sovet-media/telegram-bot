@@ -1,21 +1,30 @@
-import re
-import string
+import json
+import sys
 from dataclasses import dataclass
 from enum import Enum
+from typing import List, Optional, Any
 
-from tinydb import TinyDB, Query, where, JSONStorage
+import psycopg2
+from psycopg2._psycopg import Error, DatabaseError
+from psycopg2.extras import DictCursor
 
-from properties import DATABASE_CONTAINER
+from properties import *
 
-media_db = TinyDB("database/media_database.json")
-up_task_db = TinyDB("database/task_database.json")
-usr_db = TinyDB(DATABASE_CONTAINER + '/user_database.json').table('users')
-
-
-class Category(Enum):
-    FILMS = "films"
-    TALES = "tales"
-    MOVIES_FOR_CHILD = "movies-for-child"
+try:
+    connect = psycopg2.connect(
+        host=DATABASE_HOST,
+        user=DATABASE_USER,
+        password=DATABASE_PASSWORD,
+        dbname=DATABASE_NAME
+    )
+    connect.autocommit = True
+    cursor = connect.cursor(cursor_factory=DictCursor)
+except DatabaseError as err:
+    print(err.pgerror)
+    print('not connected to database')
+    sys.exit(1)
+else:
+    print('connected to database')
 
 
 @dataclass
@@ -26,6 +35,7 @@ class Media:
 
 
 class UpTaskState(Enum):
+    NONE = 'none'
     DOWNLOADING = 'downloading'
     UPLOADING = 'uploading'
     SUCCESS = 'success'
@@ -34,144 +44,141 @@ class UpTaskState(Enum):
 
 @dataclass
 class UpTask:
-    id: int
-    msgs: list
-    state: UpTaskState = None
+    media_id: int
+    msgs: dict
+    state: Optional[UpTaskState]
 
 
-def media_exits(category: Category, id: int):
-    return media_db.table(category.value).contains(Query().id == id)
+def _media_from_row(row) -> Media:
+    return Media(int(row['id']), row['name'], row['url'])
 
 
-table = str.maketrans('', '', string.punctuation)
+def _uptask_from_row(row) -> UpTask:
+    msgs = dict([(int(chat_id), row['data']['msgs'][chat_id]) for chat_id in row['data']['msgs']]) if 'msgs' in row[
+        'data'] else dict()
+    return UpTask(row['media_id'], msgs, UpTaskState(row['state']))
 
 
-def search_media(category: Category, query: str):
-    result = []
-    for r in media_db.table(category.value).search(Query().name.test(
-            lambda name: query.lower() in name.translate(table).lower()
-    )):
-        result.append(Media(r["id"], r["name"], r["http_url"]))
-    return sorted(result, key=lambda m: m.name)
+def media_exits(media_id) -> bool:
+    cursor.execute('SELECT id FROM media WHERE id = %s', (media_id,))
+    return cursor.rowcount > 0
 
 
-def set_media_file_id(category: Category, id: int, file_id: int):
-    table = media_db.table(category.value)
-    table.upsert({"file_id": file_id}, Query().id == id)
+def search_media(query) -> List[Media]:
+    try:
+        cursor.execute('SELECT * FROM media WHERE to_tsvector(name) @@ plainto_tsquery(%s)', (query,))
+        if cursor.rowcount > 0:
+            return list(map(lambda row: _media_from_row(row), cursor))
+    except DatabaseError as err:
+        print(err.pgerror)
+    return []
 
 
-def get_media_file_id(category: Category, id: int):
-    table = media_db.table(category.value)
-    result = table.search(Query().id == id)
-    if len(result) > 0 and 'file_id' in result[0]:
-        return result[0]['file_id']
+def set_media_file_id(media_id, file_id):
+    cursor.execute('UPDATE media SET tg_file_id = %s WHERE id = %s', (file_id, media_id))
+
+
+def get_media_file_id(media_id) -> str:
+    try:
+        cursor.execute('SELECT tg_file_id FROM media WHERE id = %s LIMIT 1', (media_id,))
+        if cursor.rowcount > 0:
+            for row in cursor:
+                return row['tg_file_id']
+    except Error as err:
+        print(err.pgerror)
+    return ""
+
+
+def get_media(media_id) -> Optional[Media]:
+    try:
+        cursor.execute('SELECT * FROM media WHERE id = %s LIMIT 1', (media_id,))
+        if cursor.rowcount > 0:
+            for row in cursor:
+                return _media_from_row(row)
+    except Error as err:
+        print(err.pgerror)
     return
 
 
-def get_media(category: Category, id: int):
-    result = media_db.table(category.value).search(Query().id == id)[0]
-    return Media(result["id"], result["name"], result["http_url"])
+def up_task_exits(media_id) -> bool:
+    cursor.execute('SELECT id FROM task WHERE media_id = %s', (media_id,))
+    return cursor.rowcount > 0
 
 
-def up_task_exits(category: Category, id: int):
-    return up_task_db.table(category.value).contains(Query().id == id)
+def get_up_task(media_id) -> Optional[UpTask]:
+    try:
+        cursor.execute('SELECT * from task WHERE media_id = %s LIMIT 1', (media_id,))
+        if cursor.rowcount > 0:
+            for row in cursor:
+                return _uptask_from_row(row)
+    except Error as err:
+        print(err.pgerror)
+    return
 
 
-def get_up_task(category: Category, id: int, ):
-    table = up_task_db.table(category.value)
-    row = table.search(Query().id == id)[0]
-    return UpTask(row['id'], row['msgs'], UpTaskState(row['state']) if row['state'] else None)
+def set_up_task_state(media_id, state: UpTaskState):
+    cursor.execute('UPDATE task SET state = %s WHERE media_id = %s', (state.value, media_id))
 
 
-def set_up_task_state(category: Category, id: int, state: UpTaskState):
-    table = up_task_db.table(category.value)
-    table.update({
-        'state': state.value if state else None
-    }, Query().id == id)
-
-
-def add_up_task(category: Category, id: int, msgs: dict = {}):
-    table = up_task_db.table(category.value)
-    if up_task_exits(category, id):
-        add_msg_to_up_task(category, id, msgs)
+def add_up_task(media_id, msgs: dict):
+    if up_task_exits(media_id):
+        add_msgs_to_up_task(media_id, msgs)
     else:
-        table.insert({
-            'id': id,
-            'msgs': msgs,
-            'state': None,
-            'attrs': {}
-        })
+        cursor.execute('INSERT INTO task (media_id, state, data) VALUES (%s, %s, %s)',
+                       (media_id, UpTaskState.NONE.value, json.dumps({"msgs": msgs})))
 
 
-def add_msg_to_up_task(category: Category, id: int, msgs: dict = {}):
-    def merge_msgs(key: str, n: dict):
-        def transform(doc):
-            for chat in doc[key]:
-                if int(chat) in n:
-                    doc[key][chat] = doc[key][chat] + n[int(chat)]
-        return transform
-    table = up_task_db.table(category.value)
-    table.update(merge_msgs('msgs', msgs), Query().id == id)
+def add_msgs_to_up_task(media_id, msgs: dict):
+    for chat in msgs:
+        jsonb_path = '{{msgs, {}}}'.format(chat)
+        cursor.execute(
+            "UPDATE task SET data = jsonb_set(data, %s, (data#>>%s)::jsonb || %s::jsonb) WHERE media_id = %s",
+            (jsonb_path, jsonb_path, json.dumps(msgs[chat]), media_id))
 
 
-def get_tasks(category: Category):
-    table = up_task_db.table(category.value)
-    result_tasks = []
-    for row in table.all():
-        result_tasks.append(
-            UpTask(row['id'],
-                   row['msgs'],
-                   UpTaskState(row['state']) if row['state'] else None)
-        )
-    return result_tasks
+def get_tasks() -> List[UpTask]:
+    try:
+        cursor.execute('SELECT * FROM task')
+        if cursor.rowcount > 0:
+            return list(map(lambda row: _uptask_from_row(row), cursor))
+    except Error as err:
+        print(err.pgerror)
+    return []
 
 
-def remove_up_task(category: Category, id: int):
-    up_task_db.table(category.value).remove(Query().id == id)
+def remove_up_task(media_id):
+    cursor.execute('DELETE FROM task WHERE media_id = %s', (media_id,))
 
 
-def set_attr_task(category: Category, id: int, attr: str, value):
-    table = up_task_db.table(category.value)
-    docs = table.search(Query().id == id)
-    for task in docs:
-        task['attrs'][attr] = value
-    table.write_back(docs)
+def set_attr_task(media_id, attr_path: str, value):
+    cursor.execute(
+        "UPDATE task SET data = data || (CONCAT('{\"attr\":', COALESCE(data->'attr', '{}'), '}'))::jsonb WHERE media_id = %s; UPDATE task SET data = jsonb_set(data, %s, %s) WHERE media_id = %s;",
+        (media_id, "{{attr, {}}}".format(attr_path), json.dumps(value), media_id))
 
 
-def get_attr_task(category: Category, id: int, attr: str):
-    global up_task_db
-    up_task_db = TinyDB("database/task_database.json")
-    table = up_task_db.table(category.value)
-    docs = table.search(Query().id == id)
-    return docs[0]['attrs'][attr] if len(docs) > 0 and 'attrs' in docs[0] and attr in docs[0]['attrs'] else ''
-    # if len(docs) > 0 and 'attrs' in docs[0] and attr in docs[0]['attrs']:
-    #     return docs[0]['attrs'][attr]
-    # else:
-    #     return ''
+def get_attr_task(media_id, attr_path: str) -> Any:
+    try:
+        cursor.execute('SELECT data#>>%s FROM task WHERE media_id = %s', ('{{attr, {}}}'.format(attr_path), media_id))
+        if cursor.rowcount > 0:
+            for row in cursor:
+                return row[0]
+    except Error as err:
+        print(err.pgerror)
+    return
 
 
-def user_exits(user_id):
-    return usr_db.contains(where('user_id') == user_id)
+if __name__ == '__main__':
+    media_id = 9451
+    set_attr_task(media_id, 'progress', '11')
+    set_attr_task(media_id, 'progress', '33')
+    set_attr_task(media_id, 'ex', json.dumps({"msg": "error_message", "type": "FailWhenDownload"}))
+
+
+def user_exits(user_id) -> bool:
+    cursor.execute('SELECT id FROM user WHERE id = %s', (user_id,))
+    return cursor.rowcount > 0
 
 
 def add_user(user_id):
     if not user_exits(user_id):
-        usr_db.insert({'user_id': user_id})
-
-
-def set_category(user_id, category: Category):
-    if not user_exits(user_id):
-        add_user(user_id)
-    usr_db.update({
-        'category': category.value
-    }, where('user_id') == user_id)
-
-
-def get_category(user_id):
-    if not user_exits(user_id):
-        add_user(user_id)
-    user = usr_db.search(where('user_id') == user_id)[0]
-    category = None
-    if 'category' in user:
-        category = Category(user['category'])
-    return category
+        cursor.execute('INSERT INTO user (tg_user_id) VALUES (%s)', (user_id,))

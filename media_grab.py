@@ -1,53 +1,52 @@
+import sys
+import time
 import urllib.request
-from datetime import datetime
-from sys import getsizeof
+from enum import Enum
 from urllib.parse import urlparse
 
-import os.path
-from os import path
-
+import psycopg2
 from bs4 import BeautifulSoup
-from tinydb import TinyDB
+from psycopg2._psycopg import Error
+from psycopg2.extras import DictCursor, execute_values
 
-from database import Category, Media
+from database import Media
+from properties import *
 
-import argparse
+try:
+    connect = psycopg2.connect(
+        host=DATABASE_HOST,
+        user=DATABASE_USER,
+        password=DATABASE_PASSWORD,
+        dbname=DATABASE_NAME
+    )
+    cursor = connect.cursor(cursor_factory=DictCursor)
+    print('connected to database')
+except Error as err:
+    print(err.pgerror)
+    print(err.diag.message_detail)
+    sys.exit(1)
 
-argparse = argparse.ArgumentParser()
-argparse.add_argument("-save_to")
-args = argparse.parse_args()
 
-arj_media_categories = {
-    Category.FILMS.value: {"url": "http://film.arjlover.net/film/"},
-    Category.TALES.value: {"url": "http://multiki.arjlover.net/multiki/"},
-    Category.MOVIES_FOR_CHILD.value: {"url": "http://filmiki.arjlover.net/filmiki/"},
-}
+class ArjMediaCatLink(Enum):
+    FILMS = "http://film.arjlover.net/film/"
+    TALES = "http://multiki.arjlover.net/multiki/"
+    SMALL_FILMS = "http://filmiki.arjlover.net/filmiki/"
 
 
 def main():
-    if args.save_to:
-        save_to = args.save_to
-        if path.exists(args.save_to):
-            os.rename(save_to, '{}.backup'.format(save_to))
-    else:
-        save_to = 'database/generated/media_database-{}.json'.format(datetime.now().strftime("%d_%m_%Y-%I%p_%M_%S"))
-    database = TinyDB(save_to)
-    for category in arj_media_categories:
-        r = 0
-        category_table = database.table(category)
-        items = []
-        for media in get_arj_media(category):
-            items.append({"id": media.id, "name": media.name, "http_url": media.http_url})
-            r = r + 1
-        category_table.insert_multiple(items)
-        print("сохранено {} записей в {}".format(r, category))
-    print(save_to)
-    return save_to
+    for category in (ArjMediaCatLink):
+        category_start_time = time.time()
+        execute_values(cursor, 'INSERT INTO media (name, url) VALUES %s',
+                       [(m.name, m.http_url) for m in get_arj_media(category)]
+                       )
+        print('scanning {} finished {}'.format(category, time.time() - category_start_time))
+    connect.commit()
+    print('inserted {} items to database')
 
 
-def get_arj_media(category):
+def get_arj_media(category: ArjMediaCatLink):
     result = []
-    page_url = arj_media_categories[category]["url"]
+    page_url = category.value
     page_domain = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(page_url))
     page = urllib.request.urlopen(page_url)
     soup = BeautifulSoup(page.read(), "html.parser")
@@ -57,6 +56,7 @@ def get_arj_media(category):
         row_http_url = row.select_one("a:contains(http)")["href"]
         result.append(Media(i, row_title.string, page_domain + row_http_url))
         i += 1
+    print('{} media parsed'.format(i))
     return result
 
 
